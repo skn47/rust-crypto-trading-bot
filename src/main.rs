@@ -89,7 +89,7 @@ fn models(c: &Config) -> Result<Vec<Model>> {
     c.model_paths.iter().map(|p| Model::load(p)).collect()
 }
 
-fn fixture(seconds: u64) -> Vec<Event> {
+fn fixture(symbols: &[String], seconds: u64) -> Vec<Event> {
     let mut out = Vec::new();
     let base = 1_700_000_000_000_000_000;
     let mut add = |t: u64, kind: Kind| {
@@ -113,7 +113,7 @@ fn fixture(seconds: u64) -> Vec<Event> {
             },
         );
     }
-    for (i, s) in ["BTCUSDT", "ETHUSDT"].iter().enumerate() {
+    for (i, s) in symbols.iter().enumerate() {
         let p = if i == 0 { 60000.0 } else { 3000.0 };
         add(
             0,
@@ -138,7 +138,7 @@ fn fixture(seconds: u64) -> Vec<Event> {
     let mut old = [60000.0, 3000.0];
     for frame in 0..=seconds * 10 {
         let t = frame * 100 * MS;
-        for (i, s) in ["BTCUSDT", "ETHUSDT"].iter().enumerate() {
+        for (i, s) in symbols.iter().enumerate() {
             let center = if i == 0 { 60000.0 } else { 3000.0 };
             let wave = ((frame as f64 / 17.0 - i as f64 * 0.2).sin()
                 * if i == 0 { 200.0 } else { 12.0 })
@@ -195,7 +195,7 @@ fn bench(c: Config, n: usize, rate: u64, output: &Path) -> Result<()> {
         .map(|s| Model {
             version: 1,
             symbol: s.clone(),
-            features: features::names(),
+            features: features::names(&c.symbols),
             mean: vec![0.0; 37],
             scale: vec![1.0; 37],
             coefficients: vec![0.0; 37],
@@ -208,9 +208,10 @@ fn bench(c: Config, n: usize, rate: u64, output: &Path) -> Result<()> {
             alpha: 1.0,
         })
         .collect();
+    let symbols = c.symbols.clone();
     let bench_dir = std::env::temp_dir().join(format!("microengine-bench-{}", recorder::utc_ns()));
     let mut store = io::LiveStore::open(&bench_dir.join("events.jsonl"), c, m, false)?;
-    let data=fixture(n as u64/50+2).into_iter().take(n).map(|mut e| {
+    let data=fixture(&symbols, n as u64/50+2).into_iter().take(n).map(|mut e| {
         let symbol=e.kind.symbol().map(str::to_owned);
         e.raw=match &e.kind {
             Kind::Depth{first_id,last_id,prev_id,bids,asks,..}=>Some(serde_json::json!({"e":"depthUpdate","s":symbol,"U":first_id,"u":last_id,"pu":prev_id,"b":bids.iter().map(|x|[x[0].to_string(),x[1].to_string()]).collect::<Vec<_>>(),"a":asks.iter().map(|x|[x[0].to_string(),x[1].to_string()]).collect::<Vec<_>>()})),
@@ -354,7 +355,7 @@ async fn main() -> Result<()> {
         Command::Fixture { output, seconds } => {
             ensure!(seconds <= 86400, "fixture capped at one day");
             let mut f = io::create(&output)?;
-            for e in fixture(seconds) {
+            for e in fixture(&config.symbols, seconds) {
                 io::json_line(&mut f, &e)?;
             }
             f.sync_all()?;
@@ -366,6 +367,7 @@ async fn main() -> Result<()> {
         } => bench(config, events, rate, &output)?,
         Command::Score { model, input } => {
             let m = Model::load(&model)?;
+            m.validate(&m.asset_symbols())?;
             for line in BufReader::new(File::open(input)?).lines() {
                 let x: Vec<f64> = serde_json::from_str(&line?)?;
                 ensure!(

@@ -5,9 +5,9 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
-pub fn names() -> Vec<String> {
+pub fn names(symbols: &[String]) -> Vec<String> {
     let mut out = Vec::new();
-    for s in ["BTCUSDT", "ETHUSDT"] {
+    for s in symbols {
         for n in [
             "spread_bps",
             "microprice_bps",

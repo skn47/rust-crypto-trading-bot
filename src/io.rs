@@ -116,7 +116,7 @@ pub fn dataset(input: &Path, output: &Path, config: Config, python: &str) -> Res
     let manifest = output.with_extension("manifest.json");
     atomic_json(
         &manifest,
-        &serde_json::json!({"version":1,"features":features::names(),"horizon_ms":1000,"source_sha256":hash(input)?,"rows":count,"config":config}),
+        &serde_json::json!({"version":1,"features":features::names(&config.symbols),"horizon_ms":1000,"source_sha256":hash(input)?,"rows":count,"config":config}),
     )?;
     let status = std::process::Command::new(python)
         .args(["-m", "research.pipeline", "parquet", "--rows"])

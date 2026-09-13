@@ -38,7 +38,7 @@ impl Engine {
     pub fn new(config: Config, models: Vec<Model>) -> Result<Self> {
         config.validate()?;
         for m in &models {
-            m.validate()?;
+            m.validate(&config.symbols)?;
         }
         ensure!(
             models.len() <= 2 && (models.len() != 2 || models[0].symbol != models[1].symbol),

@@ -21,20 +21,30 @@ pub struct Model {
 }
 impl Model {
     pub fn load(path: &str) -> Result<Self> {
-        let m: Self = serde_json::from_reader(std::fs::File::open(path)?)?;
-        m.validate()?;
-        Ok(m)
+        Ok(serde_json::from_reader(std::fs::File::open(path)?)?)
     }
-    pub fn validate(&self) -> Result<()> {
-        let n = features::names();
+    /// The distinct per-asset prefixes this model's own feature vector was built from,
+    /// in first-seen order (e.g. `["BTCUSDT", "ETHUSDT"]`). Used to self-validate a
+    /// model file when no venue configuration is available (see `score`).
+    pub fn asset_symbols(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for f in &self.features {
+            if let Some((prefix, _)) = f.split_once('.')
+                && prefix != "BTC_minus_ETH"
+                && !out.iter().any(|s| s == prefix)
+            {
+                out.push(prefix.to_owned());
+            }
+        }
+        out
+    }
+    pub fn validate(&self, symbols: &[String]) -> Result<()> {
+        let n = features::names(symbols);
         ensure!(
             self.version == 1 && self.horizon_ms == 1000,
             "unsupported model contract"
         );
-        ensure!(
-            ["BTCUSDT", "ETHUSDT"].contains(&self.symbol.as_str()),
-            "unsupported model symbol"
-        );
+        ensure!(symbols.contains(&self.symbol), "unsupported model symbol");
         ensure!(
             self.features == n
                 && self.mean.len() == n.len()
