@@ -1,7 +1,8 @@
 use crate::{
-    config::Config,
+    config::{Config, Venue},
     io::LiveStore,
-    types::{Event, Kind, MS, SCHEMA, SECOND},
+    types::{Event, Kind, MS, SCHEMA},
+    venue::coinbase,
 };
 use anyhow::{Context, Result, ensure};
 use futures_util::{SinkExt, StreamExt};
@@ -10,7 +11,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 pub fn utc_ns() -> u64 {
@@ -82,7 +83,7 @@ pub fn decode(raw: &Value) -> Result<Option<(Kind, Option<u64>)>> {
     Ok(Some((kind, v["E"].as_u64().map(|x| x * MS))))
 }
 enum Input {
-    Raw(String),
+    Raw(&'static str, String),
     Ready(Kind, Value),
     Snapshot(usize, u64, Value),
     SnapshotError(usize, String),
@@ -122,11 +123,20 @@ fn send(bus: &Bus, input: Input) {
     bus.lock().unwrap().send(input);
 }
 
-async fn socket(url: String, source: &'static str, bus: Bus) {
+async fn socket(
+    url: String,
+    source: &'static str,
+    bus: Bus,
+    subscribe: Vec<Value>,
+    gap: Arc<Notify>,
+) {
     let mut backoff = 1;
     loop {
         let result: Result<()> = async {
             let (mut ws, _) = connect_async(&url).await?;
+            for msg in &subscribe {
+                ws.send(Message::Text(msg.to_string().into())).await?;
+            }
             send(
                 &bus,
                 Input::Ready(
@@ -139,14 +149,16 @@ async fn socket(url: String, source: &'static str, bus: Bus) {
             );
             backoff = 1;
             loop {
-                let msg = tokio::time::timeout(Duration::from_secs(15), ws.next())
-                    .await?
-                    .context("socket closed")??;
-                match msg {
-                    Message::Text(s) => send(&bus, Input::Raw(s.to_string())),
-                    Message::Ping(p) => ws.send(Message::Pong(p)).await?,
-                    Message::Close(_) => anyhow::bail!("remote close"),
-                    _ => (),
+                tokio::select! {
+                    _ = gap.notified() => anyhow::bail!("forced reconnect: sequence gap"),
+                    msg = tokio::time::timeout(Duration::from_secs(15), ws.next()) => {
+                        match msg?.context("socket closed")?? {
+                            Message::Text(s) => send(&bus, Input::Raw(source, s.to_string())),
+                            Message::Ping(p) => ws.send(Message::Pong(p)).await?,
+                            Message::Close(_) => anyhow::bail!("remote close"),
+                            _ => (),
+                        }
+                    }
                 }
             }
         }
@@ -216,7 +228,10 @@ pub async fn run(mut store: LiveStore, seconds: Option<u64>) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
-    let initial = metadata(&client, &c).await?;
+    let initial = match c.venue {
+        Venue::BinanceUsdm => metadata(&client, &c).await?,
+        Venue::CoinbaseSpot => coinbase::metadata(&client, &c).await?,
+    };
     let (tx, mut rx) = mpsc::channel(c.queue_capacity);
     let (fatal_tx, mut fatal_rx) = watch::channel(None);
     let start = Instant::now();
@@ -235,33 +250,64 @@ pub async fn run(mut store: LiveStore, seconds: Option<u64>) -> Result<()> {
     for (k, v) in initial {
         send(&bus, Input::Ready(k, v));
     }
-    let depth = c
-        .symbols
-        .iter()
-        .map(|s| format!("{}@depth@100ms", s.to_lowercase()))
-        .collect::<Vec<_>>()
-        .join("/");
-    let market = c
-        .symbols
-        .iter()
-        .flat_map(|s| {
-            [
-                format!("{}@aggTrade", s.to_lowercase()),
-                format!("{}@markPrice@1s", s.to_lowercase()),
-            ]
-        })
-        .collect::<Vec<_>>()
-        .join("/");
+    let (public_url, public_sub, market_url, market_sub) = match c.venue {
+        Venue::BinanceUsdm => {
+            let depth = c
+                .symbols
+                .iter()
+                .map(|s| format!("{}@depth@100ms", s.to_lowercase()))
+                .collect::<Vec<_>>()
+                .join("/");
+            let market = c
+                .symbols
+                .iter()
+                .flat_map(|s| {
+                    [
+                        format!("{}@aggTrade", s.to_lowercase()),
+                        format!("{}@markPrice@1s", s.to_lowercase()),
+                    ]
+                })
+                .collect::<Vec<_>>()
+                .join("/");
+            (
+                format!("{}?streams={depth}", c.public_ws),
+                Vec::new(),
+                format!("{}?streams={market}", c.market_ws),
+                Vec::new(),
+            )
+        }
+        Venue::CoinbaseSpot => {
+            let ids = c.symbols.clone();
+            (
+                c.public_ws.clone(),
+                vec![
+                    json!({"type":"subscribe","product_ids":ids,"channel":"level2"}),
+                    json!({"type":"subscribe","product_ids":ids,"channel":"heartbeats"}),
+                ],
+                c.market_ws.clone(),
+                vec![
+                    json!({"type":"subscribe","product_ids":ids,"channel":"market_trades"}),
+                    json!({"type":"subscribe","product_ids":ids,"channel":"heartbeats"}),
+                ],
+            )
+        }
+    };
+    let public_gap = Arc::new(Notify::new());
+    let market_gap = Arc::new(Notify::new());
     let tasks = vec![
         tokio::spawn(socket(
-            format!("{}?streams={depth}", c.public_ws),
+            public_url,
             "public",
             bus.clone(),
+            public_sub,
+            public_gap.clone(),
         )),
         tokio::spawn(socket(
-            format!("{}?streams={market}", c.market_ws),
+            market_url,
             "market",
             bus.clone(),
+            market_sub,
+            market_gap.clone(),
         )),
     ];
     let timer_bus = bus.clone();
@@ -286,75 +332,83 @@ pub async fn run(mut store: LiveStore, seconds: Option<u64>) -> Result<()> {
         .min()
         .unwrap_or(anchor)
         / MS;
-    let funding = tokio::spawn(async move {
-        let mut starts = [funding_start; 2];
-        let mut polls = 0_u64;
-        loop {
-            for (i, s) in fund_c.symbols.iter().enumerate() {
-                let result: Result<()> = async {
-                    loop {
-                        let rows: Value = fund_client
-                            .get(format!("{}/fapi/v1/fundingRate", fund_c.rest_url))
-                            .query(&[
-                                ("symbol", s.clone()),
-                                ("startTime", starts[i].to_string()),
-                                ("limit", "1000".into()),
-                            ])
-                            .send()
-                            .await?
-                            .error_for_status()?
-                            .json()
-                            .await?;
-                        let a = rows.as_array().context("funding response not array")?;
-                        for r in a {
-                            let t = id(&r["fundingTime"])?;
-                            send(
-                                &fund_bus,
-                                Input::Ready(
-                                    Kind::Funding {
-                                        symbol: s.clone(),
-                                        funding_ns: t * MS,
-                                        rate: num(&r["fundingRate"])?,
-                                        mark: num(&r["markPrice"])?,
-                                    },
-                                    r.clone(),
-                                ),
-                            );
-                            starts[i] = starts[i].max(t + 1);
+    // Coinbase spot has no funding settlements to poll.
+    let funding = (c.venue == Venue::BinanceUsdm).then(move || {
+        tokio::spawn(async move {
+            let mut starts = [funding_start; 2];
+            let mut polls = 0_u64;
+            loop {
+                for (i, s) in fund_c.symbols.iter().enumerate() {
+                    let result: Result<()> = async {
+                        loop {
+                            let rows: Value = fund_client
+                                .get(format!("{}/fapi/v1/fundingRate", fund_c.rest_url))
+                                .query(&[
+                                    ("symbol", s.clone()),
+                                    ("startTime", starts[i].to_string()),
+                                    ("limit", "1000".into()),
+                                ])
+                                .send()
+                                .await?
+                                .error_for_status()?
+                                .json()
+                                .await?;
+                            let a = rows.as_array().context("funding response not array")?;
+                            for r in a {
+                                let t = id(&r["fundingTime"])?;
+                                send(
+                                    &fund_bus,
+                                    Input::Ready(
+                                        Kind::Funding {
+                                            symbol: s.clone(),
+                                            funding_ns: t * MS,
+                                            rate: num(&r["fundingRate"])?,
+                                            mark: num(&r["markPrice"])?,
+                                        },
+                                        r.clone(),
+                                    ),
+                                );
+                                starts[i] = starts[i].max(t + 1);
+                            }
+                            if a.len() < 1000 {
+                                break;
+                            }
                         }
-                        if a.len() < 1000 {
-                            break;
-                        }
+                        Ok(())
                     }
-                    Ok(())
-                }
-                .await;
-                if let Err(e) = result {
-                    send(
-                        &fund_bus,
-                        Input::Disconnect(format!("funding refresh failed: {e}")),
-                    );
-                }
-            }
-            polls += 1;
-            if polls.is_multiple_of(30) {
-                match metadata(&fund_client, &fund_c).await {
-                    Ok(rows) => {
-                        for (k, v) in rows {
-                            send(&fund_bus, Input::Ready(k, v));
-                        }
+                    .await;
+                    if let Err(e) = result {
+                        send(
+                            &fund_bus,
+                            Input::Disconnect(format!("funding refresh failed: {e}")),
+                        );
                     }
-                    Err(e) => send(
-                        &fund_bus,
-                        Input::Disconnect(format!("metadata refresh failed: {e}")),
-                    ),
                 }
+                polls += 1;
+                if polls.is_multiple_of(30) {
+                    match metadata(&fund_client, &fund_c).await {
+                        Ok(rows) => {
+                            for (k, v) in rows {
+                                send(&fund_bus, Input::Ready(k, v));
+                            }
+                        }
+                        Err(e) => send(
+                            &fund_bus,
+                            Input::Disconnect(format!("metadata refresh failed: {e}")),
+                        ),
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(60)).await;
             }
-            tokio::time::sleep(Duration::from_secs(60)).await;
-        }
+        })
     });
     let mut pending = [false; 2];
     let mut request_epoch = [0_u64; 2];
+    // Coinbase assigns sequence_num per connection, not per product, so a gap
+    // is detected here (not inside the decoder) and forces that socket to
+    // reconnect, which yields a fresh snapshot and a new sequence at 0.
+    let mut coinbase_last_seq: [Option<u64>; 2] = [None, None];
+    let mut coinbase_decoder = coinbase::Decoder::default();
     let mut count = 0_u64;
     let mut latency_max = 0_u128;
     let outcome:Result<()>=async {
@@ -366,40 +420,60 @@ pub async fn run(mut store: LiveStore, seconds: Option<u64>) -> Result<()> {
                 q=rx.recv()=>q.context("ingress closed")?,
             };
             ensure!(q.received.elapsed()<=Duration::from_millis(c.stale_ms),"processing backlog exceeds freshness limit");
-            let (kind,raw,exchange_ns)=match q.input {
-                Input::Raw(text)=>{
+            let events:Vec<(Kind,Option<Value>,Option<u64>)>=match q.input {
+                Input::Raw(source,text)=>{
                     let v:Value=serde_json::from_str(&text)?;
-                    match decode(&v)? {Some((k,t))=>(k,Some(v),t),None=>continue}
+                    match c.venue {
+                        Venue::BinanceUsdm=>match decode(&v)? {Some((k,t))=>vec![(k,Some(v),t)],None=>continue},
+                        Venue::CoinbaseSpot=>{
+                            let seq=v["sequence_num"].as_u64().context("missing sequence_num")?;
+                            let idx=match source {"public"=>0,"market"=>1,_=>anyhow::bail!("unknown feed")};
+                            let gap=coinbase_last_seq[idx].is_some_and(|last|seq!=last+1);
+                            coinbase_last_seq[idx]=Some(seq);
+                            if gap {
+                                (if idx==0 {&public_gap} else {&market_gap}).notify_one();
+                                continue;
+                            }
+                            coinbase_decoder.decode(&v)?.into_iter().map(|(k,t)|(k,Some(v.clone()),t)).collect()
+                        }
+                    }
                 }
-                Input::Ready(k,v)=>(k,Some(v),None),
+                Input::Ready(k,v)=>vec![(k,Some(v),None)],
                 Input::Snapshot(i,g,v)=>{
                     if g!=request_epoch[i] {continue;}
                     pending[i]=false;
-                    (Kind::Snapshot{symbol:c.symbols[i].clone(),last_id:id(&v["lastUpdateId"])?,bids:levels(&v["bids"])?,asks:levels(&v["asks"])?},Some(v),None)
+                    vec![(Kind::Snapshot{symbol:c.symbols[i].clone(),last_id:id(&v["lastUpdateId"])?,bids:levels(&v["bids"])?,asks:levels(&v["asks"])?},Some(v),None)]
                 }
-                Input::SnapshotError(i,reason)=>{pending[i]=false;(Kind::Disconnect{reason},None,None)},
-                Input::Disconnect(reason)=>(Kind::Disconnect{reason},None,None),
-                Input::Timer=>(Kind::Timer,None,None),
+                Input::SnapshotError(i,reason)=>{pending[i]=false;vec![(Kind::Disconnect{reason},None,None)]},
+                Input::Disconnect(reason)=>vec![(Kind::Disconnect{reason},None,None)],
+                Input::Timer=>vec![(Kind::Timer,None,None)],
             };
-            let disconnect=matches!(kind,Kind::Disconnect{..}|Kind::Connection{connected:false,..});
-            let e=Event{version:SCHEMA,session:session.clone(),seq:store.engine.last_seq+1,recv_ns:q.recv_ns,utc_ns:q.utc_ns,exchange_ns,raw,kind};
-            store.push(&e)?;
-            latency_max=latency_max.max(q.received.elapsed().as_nanos());count+=1;
-            if disconnect {for i in 0..2 {pending[i]=false;request_epoch[i]+=1;}}
-            for i in 0..2 {
-                if !pending[i] && store.engine.books[i].last_id.is_none() && !store.engine.books[i].buffer.is_empty() {
-                    pending[i]=true;request_epoch[i]+=1;
-                    let generation=request_epoch[i];let snapshot_bus=bus.clone();let snapshot_client=client.clone();
-                    let url=format!("{}/fapi/v1/depth?symbol={}&limit=1000",c.rest_url,c.symbols[i]);
-                    tokio::spawn(async move {
-                        let result:Result<Value>=async {Ok(snapshot_client.get(url).send().await?.error_for_status()?.json().await?)}.await;
-                        match result {Ok(v)=>send(&snapshot_bus,Input::Snapshot(i,generation,v)),Err(e)=>send(&snapshot_bus,Input::SnapshotError(i,e.to_string()))}
-                    });
+            for (kind,raw,exchange_ns) in events {
+                if let Kind::Connection{source,connected:true}=&kind {
+                    match source.as_str() {"public"=>coinbase_last_seq[0]=None,"market"=>coinbase_last_seq[1]=None,_=>()}
+                }
+                let disconnect=matches!(kind,Kind::Disconnect{..}|Kind::Connection{connected:false,..});
+                let e=Event{version:SCHEMA,session:session.clone(),seq:store.engine.last_seq+1,recv_ns:q.recv_ns,utc_ns:q.utc_ns,exchange_ns,raw,kind};
+                store.push(&e)?;
+                latency_max=latency_max.max(q.received.elapsed().as_nanos());count+=1;
+                if disconnect {for i in 0..2 {pending[i]=false;request_epoch[i]+=1;}}
+                if c.venue==Venue::BinanceUsdm {
+                    for i in 0..2 {
+                        if !pending[i] && store.engine.books[i].last_id.is_none() && !store.engine.books[i].buffer.is_empty() {
+                            pending[i]=true;request_epoch[i]+=1;
+                            let generation=request_epoch[i];let snapshot_bus=bus.clone();let snapshot_client=client.clone();
+                            let url=format!("{}/fapi/v1/depth?symbol={}&limit=1000",c.rest_url,c.symbols[i]);
+                            tokio::spawn(async move {
+                                let result:Result<Value>=async {Ok(snapshot_client.get(url).send().await?.error_for_status()?.json().await?)}.await;
+                                match result {Ok(v)=>send(&snapshot_bus,Input::Snapshot(i,generation,v)),Err(e)=>send(&snapshot_bus,Input::SnapshotError(i,e.to_string()))}
+                            });
+                        }
+                    }
                 }
             }
-            if e.recv_ns>=store.last_checkpoint_ns+SECOND {
+            if q.recv_ns>=store.last_checkpoint_ns+c.checkpoint_ms*MS {
                 store.checkpoint_background()?;
-                eprintln!("{}",json!({"event":"health","events":count,"queue_depth":rx.len(),"latency_max_us":latency_max/1000,"books_valid":store.engine.valid_at(e.recv_ns),"gaps":store.engine.gaps,"equity":store.engine.broker.equity,"exposure_unpriced":store.engine.broker.exposure_unpriced}));
+                eprintln!("{}",json!({"event":"health","events":count,"queue_depth":rx.len(),"latency_max_us":latency_max/1000,"books_valid":store.engine.valid_at(store.engine.now),"gaps":store.engine.gaps,"equity":store.engine.broker.equity,"exposure_unpriced":store.engine.broker.exposure_unpriced}));
                 latency_max=0;
             }
             if seconds.is_some_and(|s|start.elapsed()>=Duration::from_secs(s)) {break;}
@@ -410,7 +484,9 @@ pub async fn run(mut store: LiveStore, seconds: Option<u64>) -> Result<()> {
         task.abort();
     }
     timer.abort();
-    funding.abort();
+    if let Some(f) = funding {
+        f.abort();
+    }
     // Preserve exposure; shutting down never invents a fill.
     let now = (anchor + start.elapsed().as_nanos() as u64).max(store.engine.now + 1);
     let e = Event {
