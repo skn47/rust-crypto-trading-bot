@@ -7,3 +7,4 @@ pub mod model;
 pub mod paper;
 pub mod recorder;
 pub mod types;
+pub mod venue;
