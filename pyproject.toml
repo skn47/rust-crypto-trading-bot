@@ -1,0 +1,23 @@
+[project]
+name = "microengine-research"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["numpy>=2,<3", "pyarrow>=19,<24"]
+
+[dependency-groups]
+dev = ["pytest>=8,<10"]
+
+[project.scripts]
+micro-train = "research.pipeline:train_cli"
+micro-evaluate = "research.pipeline:evaluate_cli"
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["research"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+

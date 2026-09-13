@@ -1,0 +1,8 @@
+/target/
+/.venv/
+__pycache__/
+.pytest_cache/
+/data/
+/artifacts/
+*.egg-info/
+
