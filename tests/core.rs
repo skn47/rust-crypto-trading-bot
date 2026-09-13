@@ -7,10 +7,14 @@ use microengine::{
     model::Model,
     paper::Broker,
     types::{Event, Kind, MS},
+    venue::coinbase,
 };
 
 fn config() -> Config {
     toml::from_str(include_str!("../config/default.toml")).unwrap()
+}
+fn coinbase_config() -> Config {
+    toml::from_str(include_str!("../config/coinbase.toml")).unwrap()
 }
 fn event(seq: u64, ms: u64, kind: Kind) -> Event {
     Event {
@@ -89,11 +93,63 @@ fn stream(frames: u64) -> Vec<Event> {
     }
     out
 }
+fn coinbase_l2(symbol: &str, msg_type: &str, seq_num: u64) -> serde_json::Value {
+    serde_json::json!({
+        "channel": "l2_data",
+        "sequence_num": seq_num,
+        "events": [{
+            "type": msg_type,
+            "product_id": symbol,
+            "updates": [
+                {"side": "bid", "price_level": "99.9", "new_quantity": "10"},
+                {"side": "offer", "price_level": "100.1", "new_quantity": "10"}
+            ]
+        }]
+    })
+}
+fn coinbase_stream(frames: u64) -> Vec<Event> {
+    let mut decoder = coinbase::Decoder::default();
+    let mut out = Vec::new();
+    let mut add = |ms, k| out.push(event(out.len() as u64 + 1, ms, k));
+    for source in ["public", "market"] {
+        add(
+            0,
+            Kind::Connection {
+                source: source.into(),
+                connected: true,
+            },
+        );
+    }
+    for s in ["BTC-USD", "ETH-USD"] {
+        add(0, metadata(s));
+    }
+    let mut seq_num = 0u64;
+    for s in ["BTC-USD", "ETH-USD"] {
+        seq_num += 1;
+        let (kind, _) = decoder
+            .decode(&coinbase_l2(s, "snapshot", seq_num))
+            .unwrap()
+            .remove(0);
+        add(0, kind);
+    }
+    for i in 0..frames {
+        for s in ["BTC-USD", "ETH-USD"] {
+            seq_num += 1;
+            let (kind, _) = decoder
+                .decode(&coinbase_l2(s, "update", seq_num))
+                .unwrap()
+                .remove(0);
+            add(i * 100, kind);
+        }
+        add(i * 100, Kind::Timer);
+    }
+    out
+}
 fn model() -> Model {
     Model {
         version: 1,
         symbol: "BTCUSDT".into(),
-        features: features::names(),
+        features: features::names(&config().symbols),
         mean: vec![0.0; 37],
         scale: vec![1.0; 37],
         coefficients: vec![0.0; 37],
@@ -105,6 +161,68 @@ fn model() -> Model {
         entry_buffer_bps: 0.0,
         alpha: 1.0,
     }
+}
+
+#[test]
+fn engine_accepts_a_coinbase_configuration() {
+    assert!(Engine::new(coinbase_config(), vec![]).is_ok());
+}
+
+#[test]
+fn engine_validates_model_feature_names_against_venue_symbols() {
+    let cb = coinbase_config();
+    let mut coinbase_model = model();
+    coinbase_model.symbol = "BTC-USD".into();
+    coinbase_model.features = features::names(&cb.symbols);
+    assert!(Engine::new(cb.clone(), vec![coinbase_model]).is_ok());
+
+    let binance_model = model();
+    assert!(Engine::new(cb, vec![binance_model]).is_err());
+}
+
+#[test]
+fn coinbase_sequence_stays_valid_and_emits_samples_after_warmup() {
+    let mut eng = Engine::new(coinbase_config(), vec![]).unwrap();
+    let mut samples = 0;
+    for e in coinbase_stream(60) {
+        if eng.on_event(&e).unwrap().0.is_some() {
+            samples += 1;
+        }
+    }
+    assert!(eng.valid_at(eng.now));
+    assert!(samples > 0);
+}
+
+#[test]
+fn coinbase_buy_trade_pushes_100ms_trade_flow_negative() {
+    let mut eng = Engine::new(coinbase_config(), vec![]).unwrap();
+    let mut seq = 0u64;
+    for e in coinbase_stream(60) {
+        seq = e.seq;
+        eng.on_event(&e).unwrap();
+    }
+    let trade_raw = serde_json::json!({
+        "channel": "market_trades",
+        "sequence_num": 1,
+        "events": [{
+            "type": "update",
+            "trades": [{"product_id": "BTC-USD", "trade_id": "1", "price": "100", "size": "0.5", "side": "BUY"}]
+        }]
+    });
+    let (trade_kind, _) = coinbase::Decoder::default()
+        .decode(&trade_raw)
+        .unwrap()
+        .remove(0);
+    seq += 1;
+    eng.on_event(&event(seq, 6010, trade_kind)).unwrap();
+    seq += 1;
+    let (sample, _) = eng.on_event(&event(seq, 6090, Kind::Timer)).unwrap();
+    let names = features::names(&coinbase_config().symbols);
+    let idx = names
+        .iter()
+        .position(|n| n == "BTC-USD.trade_flow_100ms")
+        .unwrap();
+    assert_eq!(sample.unwrap().features[idx], -1.0);
 }
 
 #[test]
@@ -197,10 +315,10 @@ fn stale_or_disconnected_cross_asset_feed_stops_signals() {
 fn artifact_validation_and_training_cutoff_are_enforced() {
     let mut m = model();
     m.scale[0] = 0.0;
-    assert!(m.validate().is_err());
+    assert!(m.validate(&config().symbols).is_err());
     m = model();
     m.features.swap(0, 1);
-    assert!(m.validate().is_err());
+    assert!(m.validate(&config().symbols).is_err());
     m = model();
     m.selected_through_ns = u64::MAX;
     let mut eng = Engine::new(config(), vec![m]).unwrap();

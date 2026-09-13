@@ -98,3 +98,27 @@ def test_small_dataset_fails_after_purging():
     t = np.arange(30, dtype=np.uint64) * 100_000_000
     with pytest.raises(ValueError, match="insufficient"):
         split_masks(t, t + 1_000_000_000)
+
+
+@pytest.fixture(scope="module")
+def coinbase_experiment(tmp_path_factory):
+    assert ENGINE.exists(), "run cargo build before pytest"
+    folder = tmp_path_factory.mktemp("coinbase_experiment")
+    cfg = ROOT / "config/coinbase.toml"
+    events = folder / "events.jsonl"
+    dataset = folder / "dataset.parquet"
+    models = folder / "models"
+    run("--config", cfg, "fixture", "--output", events, "--seconds", 180)
+    run("--config", cfg, "dataset", "--input", events, "--output", dataset)
+    report = train(dataset, models)
+    return folder, events, dataset, models, report
+
+
+def test_pipeline_is_symbol_agnostic_for_coinbase(coinbase_experiment):
+    folder, events, dataset, models, report = coinbase_experiment
+    assert list(report["symbols"]) == ["BTC-USD", "ETH-USD"]
+    assert (models / "BTC-USD.json").exists()
+    assert (models / "ETH-USD.json").exists()
+    evaluation = evaluate(dataset, models, folder / "evaluation.json", events, ENGINE, ROOT / "config/coinbase.toml")
+    assert list(evaluation["symbols"]) == ["BTC-USD", "ETH-USD"]
+    assert evaluation["simulation"]["samples"] > 0
