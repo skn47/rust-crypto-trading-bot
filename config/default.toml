@@ -1,0 +1,17 @@
+symbols = ["BTCUSDT", "ETHUSDT"]
+public_ws = "wss://fstream.binance.com/public/stream"
+market_ws = "wss://fstream.binance.com/market/stream"
+rest_url = "https://fapi.binance.com"
+stale_ms = 500
+warmup_ms = 5000
+decision_ms = 100
+horizon_ms = 1000
+latency_ms = 50
+fee_bps = 5.0
+equity = 10000.0
+entry_notional = 100.0
+gross_cap = 1000.0
+daily_loss = 100.0
+queue_capacity = 8192
+model_paths = []
+
