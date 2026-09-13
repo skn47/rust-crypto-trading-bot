@@ -128,7 +128,7 @@ def train(dataset: Path, output: Path) -> dict:
               "test_start_ns": int(d["recv_ns"][masks["test"]].min()),
               "test_end_ns": int(d["label_end_ns"][masks["test"]].max()),
               "buffer_selection": "validation mid-return proxy after spread and assumed fees; overlapping opportunities are not an executable P&L estimate"}
-    for i, symbol in enumerate(("BTCUSDT", "ETHUSDT")):
+    for i, symbol in enumerate(manifest["config"]["symbols"]):
         sm = {name: mask & (d["symbol"] == symbol) for name, mask in masks.items()}
         if any(mask.sum() < 10 for mask in sm.values()):
             raise ValueError(f"insufficient {symbol} rows")
@@ -164,8 +164,9 @@ def evaluate(dataset: Path, models: Path, output: Path, events: Path | None = No
     masks, boundaries = split_masks(d["recv_ns"], d["label_end_ns"])
     if boundaries != training["splits"]:
         raise ValueError("split mismatch")
+    symbols = list(training["symbols"])
     report = {"dataset_sha256": training["dataset_sha256"], "symbols": {}, "simulation": "not requested"}
-    for symbol in ("BTCUSDT", "ETHUSDT"):
+    for symbol in symbols:
         mask = masks["test"] & (d["symbol"] == symbol)
         result = {}
         for name, suffix in (("cross_asset", ""), ("own_asset", ".own")):
@@ -188,7 +189,7 @@ def evaluate(dataset: Path, models: Path, output: Path, events: Path | None = No
         output.parent.mkdir(parents=True, exist_ok=True)
         # Append model_paths to a copied config after removing its original declaration.
         lines = [line for line in config.read_text().splitlines() if not line.strip().startswith("model_paths")]
-        paths = [str((models / f"{s}.json").resolve()) for s in ("BTCUSDT", "ETHUSDT")]
+        paths = [str((models / f"{s}.json").resolve()) for s in symbols]
         replay_config = output.with_suffix(".replay.toml")
         replay_config.write_text("\n".join(lines) + "\nmodel_paths = " + json.dumps(paths) + "\n")
         replay_report = output.with_suffix(".execution.json")
