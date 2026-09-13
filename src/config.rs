@@ -1,9 +1,18 @@
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Venue {
+    #[default]
+    BinanceUsdm,
+    CoinbaseSpot,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default)]
+    pub venue: Venue,
     pub symbols: Vec<String>,
     pub public_ws: String,
     pub market_ws: String,
@@ -19,7 +28,12 @@ pub struct Config {
     pub gross_cap: f64,
     pub daily_loss: f64,
     pub queue_capacity: usize,
+    #[serde(default = "default_checkpoint_ms")]
+    pub checkpoint_ms: u64,
     pub model_paths: Vec<String>,
+}
+fn default_checkpoint_ms() -> u64 {
+    1000
 }
 impl Config {
     pub fn load(path: &std::path::Path) -> Result<Self> {
@@ -28,9 +42,13 @@ impl Config {
         Ok(c)
     }
     pub fn validate(&self) -> Result<()> {
+        let expected: &[&str] = match self.venue {
+            Venue::BinanceUsdm => &["BTCUSDT", "ETHUSDT"],
+            Venue::CoinbaseSpot => &["BTC-USD", "ETH-USD"],
+        };
         ensure!(
-            self.symbols == ["BTCUSDT", "ETHUSDT"],
-            "v1 requires BTCUSDT, ETHUSDT in that order"
+            self.symbols == expected,
+            "v1 requires this venue's BTC, ETH symbols in that order"
         );
         ensure!(
             self.decision_ms == 100 && self.horizon_ms == 1000 && self.warmup_ms >= 5000,
